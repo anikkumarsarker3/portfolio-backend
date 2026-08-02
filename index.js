@@ -21,6 +21,8 @@ app.use(express.json());
 
 const port = process.env.PORT || 3000;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'dev-token-123';
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'anikk0388@gmail.com').trim().toLowerCase();
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || 'AnikAdmin03');
 const isValidObjectId = (id) => ObjectId.isValid(id) && String(new ObjectId(id)) === id;
 const normalizeEmail = (email) => {
     if (!email || typeof email !== 'string') return '';
@@ -72,7 +74,16 @@ const client = new MongoClient(uri, {
 
 // Admin authentication middleware
 const authenticateAdmin = (req, res, next) => {
-    const token = req.headers['admin-token'];
+    const tokenFromHeader = req.headers['admin-token'];
+    const authHeader = req.headers['authorization'];
+    const tokenFromBearer = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : '';
+    const tokenFromQuery = typeof req.query?.adminToken === 'string'
+        ? req.query.adminToken.trim()
+        : '';
+
+    const token = String(tokenFromHeader || tokenFromBearer || tokenFromQuery || '').trim();
     if (!token || token !== ADMIN_TOKEN) {
         return res.status(401).json({
             status: false,
@@ -127,8 +138,9 @@ async function run() {
             socket.on('send_message', async (payload, ack) => {
                 const safeAck = typeof ack === 'function' ? ack : () => {};
                 try {
-                    const { conversationId, message, sender = 'visitor', clientMessageId } = payload || {};
-                    if (!conversationId || !message) {
+                    const { conversationId, message, clientMessageId } = payload || {};
+                    const normalizedMessage = typeof message === 'string' ? message.trim() : '';
+                    if (!conversationId || !normalizedMessage) {
                         socket.emit('error', { message: 'Conversation ID and message are required' });
                         safeAck({ status: false, message: 'Conversation ID and message are required' });
                         return;
@@ -144,8 +156,10 @@ async function run() {
                     const timestamp = new Date();
                     const newMessage = {
                         _id: new ObjectId(),
-                        message,
-                        sender,
+                        message: normalizedMessage,
+                        // Public sockets may only create visitor messages. Admin replies
+                        // use the authenticated HTTP endpoint below.
+                        sender: 'visitor',
                         timestamp,
                         clientMessageId: clientMessageId || null,
                         isRead: false
@@ -156,9 +170,7 @@ async function run() {
                         $set: { updatedAt: timestamp }
                     };
 
-                    if (sender === 'visitor' || sender === 'user') {
-                        updateOps.$inc = { unreadCount: 1 };
-                    }
+                    updateOps.$inc = { unreadCount: 1 };
 
                     const result = await conversationCollection.updateOne(
                         { _id: conversationObjectId },
@@ -204,6 +216,38 @@ async function run() {
         });
 
         // ==================== ADMIN STATS ====================
+        app.post("/api/admin/login", async (req, res) => {
+            try {
+                const username = String(req.body?.username || '').trim().toLowerCase();
+                const password = String(req.body?.password || '');
+
+                if (!username || !password) {
+                    return res.status(400).json({
+                        status: false,
+                        message: 'Username and password are required'
+                    });
+                }
+
+                if (username !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+                    return res.status(401).json({
+                        status: false,
+                        message: 'Invalid username or password'
+                    });
+                }
+
+                return res.json({
+                    status: true,
+                    token: ADMIN_TOKEN
+                });
+            } catch (error) {
+                console.error('Error in admin login:', error);
+                return res.status(500).json({
+                    status: false,
+                    message: 'Failed to login'
+                });
+            }
+        });
+
         app.get("/api/admin/stats", authenticateAdmin, async (req, res) => {
             try {
                 const totalProjects = await projectCollection.countDocuments();
@@ -318,6 +362,12 @@ async function run() {
                     }
                 );
 
+                io.emit('conversation_updated', {
+                    conversationId: new ObjectId(id).toHexString(),
+                    updatedAt: new Date(),
+                    read: true
+                });
+
                 res.json({
                     status: true,
                     message: 'Conversation marked as read',
@@ -336,8 +386,9 @@ async function run() {
         app.post("/api/admin/send-reply", authenticateAdmin, async (req, res) => {
             try {
                 const { conversationId, message } = req.body;
+                const normalizedMessage = typeof message === 'string' ? message.trim() : '';
 
-                if (!conversationId || !message) {
+                if (!conversationId || !normalizedMessage) {
                     return res.status(400).json({
                         status: false,
                         message: 'Conversation ID and message are required'
@@ -354,7 +405,7 @@ async function run() {
 
                 const newMessage = {
                     _id: new ObjectId(),
-                    message,
+                    message: normalizedMessage,
                     sender: 'admin',
                     timestamp: new Date(),
                     isRead: false
@@ -412,10 +463,11 @@ async function run() {
         // Create new conversation (from contact form)
         app.post("/api/contact", async (req, res) => {
             try {
-                const { name, email, message } = req.body;
+                const { name, email, subject, message } = req.body;
                 const normalizedName = typeof name === 'string' ? name.trim() : '';
                 const normalizedEmailRaw = typeof email === 'string' ? email.trim() : '';
                 const normalizedEmail = normalizeEmail(email);
+                const normalizedSubject = typeof subject === 'string' ? subject.trim() : '';
                 const normalizedMessage = typeof message === 'string' ? message.trim() : '';
 
                 if (!normalizedName || !normalizedEmail || !normalizedMessage) {
@@ -454,6 +506,7 @@ async function run() {
                                 name: normalizedName,
                                 email: normalizedEmailRaw,
                                 emailLower: normalizedEmail,
+                                subject: normalizedSubject,
                                 updatedAt: new Date()
                             }
                         }
@@ -464,6 +517,7 @@ async function run() {
                         name: normalizedName,
                         email: normalizedEmailRaw,
                         emailLower: normalizedEmail,
+                        subject: normalizedSubject,
                         messages: [newMessage],
                         unreadCount: 1,
                         createdAt: new Date(),
@@ -592,6 +646,76 @@ async function run() {
                 res.status(500).json({
                     status: false,
                     message: 'Failed to fetch conversation messages'
+                });
+            }
+        });
+
+        // Send visitor message via HTTP (fallback when websocket is unavailable)
+        app.post("/api/conversations/:id/messages", async (req, res) => {
+            try {
+                const { id } = req.params;
+                if (!isValidObjectId(id)) {
+                    return res.status(400).json({
+                        status: false,
+                        message: 'Invalid conversation ID'
+                    });
+                }
+
+                const { message, clientMessageId = null } = req.body || {};
+                const normalizedMessage = typeof message === 'string' ? message.trim() : '';
+                if (!normalizedMessage) {
+                    return res.status(400).json({
+                        status: false,
+                        message: 'Message is required'
+                    });
+                }
+
+                const conversationObjectId = new ObjectId(id);
+                const timestamp = new Date();
+                const newMessage = {
+                    _id: new ObjectId(),
+                    message: normalizedMessage,
+                    // This public endpoint intentionally cannot impersonate an admin.
+                    sender: 'visitor',
+                    timestamp,
+                    clientMessageId,
+                    isRead: false
+                };
+
+                const updateOps = {
+                    $push: { messages: newMessage },
+                    $set: { updatedAt: timestamp }
+                };
+                updateOps.$inc = { unreadCount: 1 };
+
+                const result = await conversationCollection.updateOne(
+                    { _id: conversationObjectId },
+                    updateOps
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).json({
+                        status: false,
+                        message: 'Conversation not found'
+                    });
+                }
+
+                const conversationId = conversationObjectId.toHexString();
+                const payload = { ...newMessage, conversationId };
+                io.to(conversationId).emit('message_received', payload);
+                io.emit('new_message', { conversationId, message: newMessage });
+                io.emit('conversation_updated', { conversationId, updatedAt: timestamp });
+
+                res.json({
+                    status: true,
+                    conversationId,
+                    data: payload
+                });
+            } catch (error) {
+                console.error('Error sending conversation message via HTTP:', error);
+                res.status(500).json({
+                    status: false,
+                    message: 'Failed to send message'
                 });
             }
         });
